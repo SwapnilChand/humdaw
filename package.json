@@ -1,1 +1,8 @@
-{"name":"humdaw","private":true,"type":"module"}
+{
+  "name": "humdaw",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node test.mjs && node test-cmd.mjs"
+  }
+}

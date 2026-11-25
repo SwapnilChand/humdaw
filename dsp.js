@@ -30,18 +30,21 @@ export function yin(x, sr, minHz = 70, maxHz = 1000, thr = 0.2) {
 }
 
 // pcm -> [{t, midi|null}] ; decimates to ~24k first (4x cheaper, pitch < 1kHz is unaffected)
-export function analyze(pcm, sr, { win = 1024, hop = 256 } = {}) {
-  const k = Math.max(1, Math.floor(sr / 20000)), len = Math.floor(pcm.length / k), s = sr / k;
+export function analyze(pcm, sr, { win = 1024, hop = 256, minHz = 70, maxHz = 1000, thr = 0.2, rate = 20000 } = {}) {
+  const k = Math.max(1, Math.floor(sr / rate)), len = Math.floor(pcm.length / k), s = sr / k;
   const d = new Float32Array(len);
   for (let i = 0; i < len; i++) { let a = 0; for (let j = 0; j < k; j++) a += pcm[i * k + j]; d[i] = a / k; }
-  const rms = [];
-  for (let i = 0; i + win <= len; i += hop) { let e = 0; for (let j = i; j < i + win; j++) e += d[j] * d[j]; rms.push(Math.sqrt(e / win)); }
+  // loudness over just the centre of each window (2 hops): a pitch window is ~43ms+, too blunt to see a 40ms gap between notes
+  const rms = [], c = Math.min(win >> 1, hop);
+  for (let i = 0; i + win <= len; i += hop) { let e = 0; for (let j = i + (win >> 1) - c; j < i + (win >> 1) + c; j++) e += d[j] * d[j]; rms.push(Math.sqrt(e / (2 * c))); }
   const gate = Math.max(0.006, 0.1 * Math.max(0, ...rms));   // adaptive: mic levels vary wildly
+  let loud = 0, voiced = 0;
   const frames = rms.map((r, f) => {
-    const i = f * hop, y = r < gate ? null : yin(d.subarray(i, i + win), s);
-    return { t: (i + win / 2) / s, midi: y ? 69 + 12 * Math.log2(y.hz / 440) : null };
+    const i = f * hop, y = r < gate ? null : yin(d.subarray(i, i + win), s, minHz, maxHz, thr);
+    if (r >= gate) { loud++; if (y) voiced++; }
+    return { t: (i + win / 2) / s, midi: y ? 69 + 12 * Math.log2(y.hz / 440) : null, rms: r };
   });
-  return { frames, hop: hop / s };
+  return { frames, hop: hop / s, voiced, loud };
 }
 
 // ---------- notes ----------
@@ -54,24 +57,48 @@ export function splitRule(dev, nOff) {
   return dev > 0.7 && nOff >= 3;
 }
 
+// A breathy / nasal / noisy hum can defeat the strict YIN threshold. If most loud frames got no pitch, retry relaxed and keep the better run.
+export function analyzeRobust(pcm, sr, opts = {}) {
+  const a = analyze(pcm, sr, opts);
+  if (a.loud && a.voiced / a.loud >= 0.6) return a;
+  const b = analyze(pcm, sr, { ...opts, thr: 0.35 });
+  return b.voiced > a.voiced ? { ...b, relaxed: true } : a;
+}
+
 // frames -> [{ts, te, pf}] in seconds, pf = float midi pitch (median of the note)
+// A note ends on (a) real silence, (b) a pitch change (splitRule), (c) an amplitude dip then rise = "hm hm" on one pitch,
+// (d) a sudden loudness jump = a re-attack on the same pitch.
 export function segment(frames, hop, { minDur = 0.08, gapMax = 0.06 } = {}) {
   const m = frames.map((_, i) => {
     const w = []; for (let j = i - 2; j <= i + 2; j++) { const v = frames[j]?.midi; if (v != null) w.push(v); }
     return w.length >= 3 ? median(w) : null;               // 5-frame median kills octave glitches
   });
-  const segs = []; let cur = null, gap = 0, off = [];
-  const close = () => { if (cur) segs.push({ ts: cur.ts, te: cur.last + hop / 2, pf: median(cur.v) }); cur = null; off = []; gap = 0; };
+  const segs = []; let cur = null, gap = 0, quiet = 0, off = [];
+  const open = (ts, t, v, r) => ({ ts, last: t, v, sum: v.reduce((a, b) => a + b, 0), pk: r, dip: null, rs: [r] });
+  const close = () => { if (cur) segs.push({ ts: cur.ts, te: cur.last + hop / 2, pf: median(cur.v) }); cur = null; off = []; gap = quiet = 0; };
   m.forEach((v, i) => {
-    const t = frames[i].t;
-    if (v == null) { if (cur && ++gap * hop > gapMax) close(); return; }
-    gap = 0;
-    if (!cur) { cur = { ts: t - hop / 2, last: t, v: [v], sum: v }; return; }
+    const t = frames[i].t, r = frames[i].rms ?? 0;
+    if (v == null) {
+      if (!cur) return;
+      quiet = r < 0.3 * cur.pk ? quiet + 1 : 0;            // silence between notes vs a pitch-tracker dropout
+      if (quiet >= 2 || ++gap * hop > gapMax) close();
+      return;
+    }
+    gap = quiet = 0;
+    if (!cur) { cur = open(t - hop / 2, t, [v], r); return; }
+    cur.pk = Math.max(cur.pk * 0.995, r);
+    const prev = cur.rs.length >= 3 ? cur.rs.slice(-3).reduce((a, b) => a + b, 0) / 3 : null;
+    cur.rs.push(r);
+    if (prev != null && r > 1.8 * prev && r > 0.5 * cur.pk) { cur.last = t - hop; close(); cur = open(t - hop / 2, t, [v], r); return; }   // re-attack without a dip (plucked bass)
+    if (r < 0.6 * cur.pk && (!cur.dip || r < cur.dip.r)) cur.dip = { r, t };
+    else if (cur.dip && r > Math.max(1.4 * cur.dip.r, 0.8 * cur.pk)) {   // dipped, now recovered: new onset
+      const ts = cur.dip.t; cur.last = ts - hop; close(); cur = open(ts, t, [v], r); return;
+    }
     const dev = Math.abs(v - cur.sum / cur.v.length);
     if (dev > 0.7) off.push({ v, t }); else off = [];
     if (off.length && splitRule(dev, off.length)) {
       const ts = off[0].t - hop / 2, vs = off.map((o) => o.v);
-      close(); cur = { ts, last: t, v: vs, sum: vs.reduce((a, b) => a + b, 0) };
+      close(); cur = open(ts, t, vs, r);
     } else if (!off.length) { cur.v.push(v); cur.sum += v; cur.last = t; }
   });
   close();
@@ -100,7 +127,23 @@ export function snap(pf, sc, root) {
 }
 
 // segs (seconds) -> mono notes on a beat grid.  origin = pcm time of beat 0, latency = mic round trip
-export function place(segs, { bpm, origin = 0, latency = 0, grid = 0.25, loopBeats, scale = 'off', root = 'auto', shift = 0 }) {
+// How far (semitones) to nudge a take so its notes sit closest to the semitone grid: fixes a singer who is
+// consistently 30 cents flat/sharp. Needs 3+ notes; prefers the smallest correction on ties.
+export function tuneOffset(segs) {
+  if (segs.length < 3) return 0;
+  let best = 0, bs = Infinity;
+  for (let i = 0; i <= 20; i++) for (const sgn of i ? [1, -1] : [1]) {
+    const o = sgn * i * 0.025; let s = 0;
+    for (const g of segs) { const x = g.pf + o; s += (g.te - g.ts) * Math.abs(x - Math.round(x)); }
+    if (s < bs - 1e-9) { bs = s; best = o; }
+  }
+  return best;
+}
+
+export function place(segs, { bpm, origin = 0, latency = 0, grid = 0.25, loopBeats, scale = 'off', root = 'auto', shift = 0, tune = true, center = null }) {
+  const off = tune ? tuneOffset(segs) : 0;
+  segs = segs.map((s) => ({ ...s, pf: s.pf + off }));
+  const fold = center != null && segs.length ? 12 * Math.round((center - median(segs.map((s) => s.pf))) / 12) : 0;   // sing anywhere, land in the track's range
   const bps = bpm / 60, sc = SCALES[scale], r = root === 'auto' ? detectKey(segs, sc) : root, out = [];
   for (const s of segs) {
     let b = (s.ts - latency - origin) * bps, e = (s.te - latency - origin) * bps;
@@ -108,12 +151,12 @@ export function place(segs, { bpm, origin = 0, latency = 0, grid = 0.25, loopBea
     if (e <= b) e = b + (grid || 0.1);
     if (e <= 0 || b >= loopBeats) continue;
     b = Math.max(0, b);
-    const n = { b, d: Math.min(e, loopBeats) - b, p: snap(s.pf, sc, r) + shift, v: 0.8 }, prev = out[out.length - 1];
+    const n = { b, d: Math.min(e, loopBeats) - b, p: snap(s.pf, sc, r) + shift + fold, v: 0.8 }, prev = out[out.length - 1];
     if (prev && n.b <= prev.b + 1e-6) { if (n.d > prev.d) out[out.length - 1] = n; continue; }   // collided after quantize
     if (prev && n.b < prev.b + prev.d) prev.d = n.b - prev.b;                                      // keep it monophonic
     out.push(n);
   }
-  return { notes: out, root: r };
+  return { notes: out, root: r, tune: off, fold };
 }
 
 // ---------- timbre matching ----------
@@ -178,4 +221,61 @@ export function toWav(chs, sr) {
   v.setUint16(32, nc * 2, true); v.setUint16(34, 16, true); str(36, 'data'); v.setUint32(40, n * nc * 2, true);
   for (let i = 0; i < n; i++) for (let c = 0; c < nc; c++) v.setInt16(44 + (i * nc + c) * 2, Math.max(-1, Math.min(1, chs[c][i])) * 32767, true);
   return new Uint8Array(v.buffer);
+}
+
+// ---------- typed notes: "e e g e d c b", "e2:1.5 f#3 - . bb" ----------
+const PC = { c: 0, d: 2, e: 4, f: 5, g: 7, a: 9, b: 11 };
+const ALIAS = { be: 'b', bee: 'b', see: 'c', sea: 'c', dee: 'd', gee: 'g' };   // what speech recognisers hear for letter names
+export const NOTE_TOKEN = /^([a-g][#b]?(-?\d)?(:\d*\.?\d+)?|[._-]|r)$/;
+// no octave given -> the octave nearest the previous note, so "e e g e d c b" keeps the riff's shape
+export function parseNotes(text, { center = 60, step = 0.5, at = 0 } = {}) {
+  const notes = [], bad = []; let b = at, prev = center, last = null;
+  for (let tok of text.toLowerCase().replace(/[,;]/g, ' ').split(/\s+/).filter(Boolean)) {
+    tok = ALIAS[tok] ?? tok;
+    if (tok === '-') { if (last) last.d += step; b += step; continue; }          // hold
+    if (tok === '.' || tok === '_' || tok === 'r') { b += step; last = null; continue; }   // rest
+    const m = tok.match(/^([a-g])([#b]?)(-?\d)?(?::(\d*\.?\d+))?$/);
+    if (!m) { bad.push(tok); continue; }
+    const pc = PC[m[1]] + (m[2] === '#' ? 1 : m[2] === 'b' ? -1 : 0), d = m[4] ? +m[4] : step;
+    const p = m[3] != null ? pc + 12 * (+m[3] + 1) : pc + 12 * Math.round((prev - pc) / 12);
+    last = { b, d, p, v: 0.8 }; notes.push(last); b += d; prev = p;
+  }
+  return { notes, bad, end: b };
+}
+
+// ---------- pulling a bass line out of a full mix (heuristic; real stem separation is a GitHub issue) ----------
+export function lowpass(x, sr, fc, passes = 2) {                                  // RBJ biquad, Q=.707, cascaded
+  const w = (2 * Math.PI * fc) / sr, c = Math.cos(w), a = Math.sin(w) / (2 * 0.7071), a0 = 1 + a;
+  const b0 = (1 - c) / 2 / a0, b1 = (1 - c) / a0, a1 = (-2 * c) / a0, a2 = (1 - a) / a0;
+  let y = x;
+  for (let p = 0; p < passes; p++) {
+    const o = new Float32Array(y.length); let x1 = 0, x2 = 0, y1 = 0, y2 = 0;
+    for (let i = 0; i < y.length; i++) { const v = y[i], r = b0 * v + b1 * x1 + b0 * x2 - a1 * y1 - a2 * y2; o[i] = r; x2 = x1; x1 = v; y2 = y1; y1 = r; }
+    y = o;
+  }
+  return y;
+}
+
+export function bassLine(x, sr) {
+  const lp = lowpass(x, sr, 260), { frames, hop } = analyze(lp, sr, { win: 768, hop: 192, minHz: 38, maxHz: 260, thr: 0.25, rate: 6000 });
+  return { lp, segs: segment(frames, hop, { minDur: 0.1 }) };
+}
+
+// onset-strength autocorrelation, 70-180 bpm (soft pull toward 120 to avoid half/double-time picks) + beat phase
+export function estimateBpm(x, sr) {
+  const H = 0.005, hop = Math.floor(sr * H), env = []; let prev = 0;
+  for (let i = 0; i + hop <= x.length; i += hop) {
+    let e = 0; for (let j = i; j < i + hop; j++) e += x[j] * x[j];
+    e = Math.sqrt(e / hop); env.push(Math.max(0, e - prev)); prev = e;
+  }
+  const lo = Math.round(60 / 180 / H), hi = Math.round(60 / 70 / H), sc = [];
+  for (let lag = lo - 1; lag <= hi + 1; lag++) {
+    let s = 0; for (let i = 0; i + lag < env.length; i++) s += env[i] * env[i + lag];
+    sc[lag] = s * Math.exp(-0.5 * (Math.log2(60 / (lag * H) / 120) / 0.8) ** 2);
+  }
+  let lag = lo; for (let l = lo; l <= hi; l++) if (sc[l] > sc[lag]) lag = l;
+  const a = sc[lag - 1], b = sc[lag], c = sc[lag + 1], den = a - 2 * b + c, P = lag + (den ? (0.5 * (a - c)) / den : 0);
+  let ph = 0, bs = -1;
+  for (let f = 0; f < Math.round(P); f++) { let s = 0; for (let k = 0; Math.round(f + k * P) < env.length; k++) s += env[Math.round(f + k * P)]; if (s > bs) { bs = s; ph = f; } }
+  return { bpm: 60 / (P * H), phase: ph * H };
 }

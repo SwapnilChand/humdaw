@@ -1,4 +1,5 @@
-import { SCALES, NOTE, name, analyze, segment, place, snap, features, dist, median, toMidi, toWav } from './dsp.js';
+import { SCALES, NOTE, name, analyze, analyzeRobust, segment, place, snap, features, dist, median, parseNotes, bassLine, estimateBpm, toMidi, toWav } from './dsp.js';
+import { parseCommand, HELP } from './cmd.js';
 import { PRESETS, voice, sampler, drum, click } from './synth.js';
 
 const $ = (s) => document.querySelector(s);
@@ -20,7 +21,7 @@ function fresh() {
   const lead = [[0, 0.75, 64], [1, 0.5, 67], [1.5, 0.5, 69], [2, 1, 67], [3, 0.5, 64], [3.5, 0.5, 62], [4, 1.5, 60], [6, 0.5, 62], [6.5, 0.5, 64], [7, 0.75, 60]].map(([b, d, p]) => ({ b, d, p, v: 0.8 }));
   const T = (name, inst, c, notes = []) => ({ name, inst, c, notes, vol: 0.8, mute: 0, solo: 0 });
   return { bpm: 88, bars: 2, key: 'auto', scale: 'major', grid: 0.25, metro: false, lat: 80, sel: 0, rootUsed: 0,
-    tracks: [T('lead', 'candy lead', 60, lead), T('bass', 'sub bass', 36, bass), T('keys', 'lofi keys', 60), { ...T('drums', '', 38, dr), drum: 1, vol: 0.9 }] };
+    tracks: [T('lead', 'candy lead', 60, lead), T('bass', 'sub bass', 40, bass), T('keys', 'lofi keys', 60), { ...T('drums', '', 38, dr), drum: 1, vol: 0.9 }] };
 }
 let S; try { S = JSON.parse(localStorage[STORE]); if (!S?.tracks?.length) throw 0; } catch { S = fresh(); }
 const samples = [];                       // {id, buf, root, loop}  (not persisted: AudioBuffers)
@@ -108,14 +109,18 @@ function finishRec() {
   rec.active = false;
   const sr = ctx.sampleRate, off = chunks[0].t, pcm = new Float32Array(chunks.length * 128);
   chunks.forEach((c, i) => pcm.set(c.d, i * 128)); chunks = []; rec = null;
-  const { frames, hop } = analyze(pcm, sr), segs = segment(frames, hop);
+  const run1 = analyzeRobust(pcm, sr), segs = segment(run1.frames, run1.hop);
   ui();
   if (!segs.length) return log('heard nothing :( hum louder, or check your mic');
+  if (run1.relaxed) log('weak pitch (breathy or noisy?): used relaxed detection, check the notes');
   snapshot();
   const r = place(segs, { bpm: S.bpm, origin: T0 - off, latency: S.lat / 1000, grid: S.grid, loopBeats: L(), scale: S.scale,
-    root: S.key === 'auto' ? 'auto' : NOTE.indexOf(S.key) });
-  sel().notes = r.notes; S.rootUsed = r.root;
-  log(`heard ${segs.length} notes, kept ${r.notes.length} · key ${NOTE[r.root]} ${S.scale}  (notes late/early? tweak “lat”)`);
+    root: S.key === 'auto' ? 'auto' : NOTE.indexOf(S.key), center: sel().c });
+  sel().notes = $('#layer').checked ? [...sel().notes, ...r.notes] : r.notes; S.rootUsed = r.root;
+  log(`heard ${segs.length} notes, kept ${r.notes.length} · key ${NOTE[r.root]} ${S.scale}`
+    + (Math.abs(r.tune) > 0.05 ? ` · you were ~${Math.round(Math.abs(r.tune) * 100)}c ${r.tune < 0 ? 'sharp' : 'flat'}, corrected` : '')
+    + (r.fold ? ` · moved ${Math.abs(r.fold / 12)} octave${Math.abs(r.fold) > 12 ? 's' : ''} ${r.fold < 0 ? 'down' : 'up'} into ${sel().name}'s range` : '')
+    + '  (late/early? tweak “lat”)');
   const best = segs.reduce((a, b) => (b.te - b.ts > a.te - a.ts ? b : a));    // longest hum note becomes an instrument
   addSample(`my hum #${++humN}`, cut(pcm, sr, best.ts, best.te), best.pf, true);
   log(`your voice is now an instrument: pick “◉ my hum #${humN}” in the timbre lab`);
@@ -132,15 +137,15 @@ const mono = (b) => { const o = new Float32Array(b.length); for (let c = 0; c < 
 function addSample(id, buf, root, loop) { samples.push({ id, buf, root, loop }); renderLab(); }
 
 let loaded = null;
+function setLoaded(buf, label, whole) {
+  loaded = { buf, x: mono(buf), name: label, sel: [0, whole ? buf.duration : Math.min(buf.duration, 2)] };
+  $('#q').value = label; $('#wv').hidden = $('#smp').hidden = false;
+  drawWave(); detectRoot(); huntLinks();
+}
 $('#file').onchange = async (e) => {
   const f = e.target.files[0]; if (!f) return;
   await ensure();
-  try {
-    const buf = await ctx.decodeAudioData(await f.arrayBuffer());
-    loaded = { buf, x: mono(buf), name: f.name.replace(/\.[^.]+$/, ''), sel: [0, Math.min(buf.duration, 2)] };
-  } catch { return log("couldn't decode that file"); }
-  $('#q').value = loaded.name; $('#wv').hidden = $('#smp').hidden = false;
-  drawWave(); detectRoot(); huntLinks();
+  try { setLoaded(await ctx.decodeAudioData(await f.arrayBuffer()), f.name.replace(/\.[^.]+$/, ''), false); } catch { return log("couldn't decode that file"); }
   log(`loaded “${f.name}” ${loaded.buf.duration.toFixed(1)}s · drag on the waveform to pick the bit you want`);
 };
 function drawWave() {
@@ -157,7 +162,7 @@ function detectRoot() {
   const sr = loaded.buf.sampleRate, [s, e] = loaded.sel, x = loaded.x.subarray(Math.floor(s * sr), Math.floor(Math.min(e, s + 3) * sr));
   const v = analyze(x, sr).frames.filter((f) => f.midi != null).map((f) => f.midi);
   $('#root').value = v.length > 3 ? median(v).toFixed(2) : 60;
-  $('#rootn').textContent = v.length > 3 ? ` ${name(median(v))}` : ' unpitched? set by ear';
+  $('#rootn').textContent = v.length > 3 ? ` ${name(median(v))}` : loaded.buf.duration > 6 ? ' (full mix: n/a)' : ' unpitched? set by ear';
 }
 {
   let d = null;
@@ -184,6 +189,55 @@ $('#match').onclick = async () => {
   log(`closest presets: ${res.slice(0, 3).map(([k, d]) => `${k} (${d.toFixed(2)})`).join(', ')} — applied #1, click others in the lab`);
   if (!sel().drum) { sel().inst = res[0][0]; changed(); preview(sel(), sel().c); }
 };
+
+// "use the bass of this track": lowpass + low-range pitch tracking on the selected region, then the clip's own bass note becomes the sound.
+// Heuristic, not stem separation: a kick on the same beat can blur repeated notes.
+async function extractBass() {
+  if (!loaded) return log('load a clip first: search a song (source hunt), or drop an audio file in the lab');
+  const sr = loaded.buf.sampleRate, [s, e] = loaded.sel, x = loaded.x.subarray(Math.floor(s * sr), Math.floor(e * sr));
+  log(`listening for bass in ${s.toFixed(1)}–${e.toFixed(1)}s of “${loaded.name}”…`);
+  await new Promise((r) => setTimeout(r));                   // let the log paint before the ~0.2s analysis
+  const { lp, segs } = bassLine(x, sr), tempo = estimateBpm(x, sr);
+  if (!segs.length) return log('no clear bass line there. Pick a region where the bass is exposed.');
+  snapshot();
+  S.bpm = Math.round(tempo.bpm); $('#bpm').value = S.bpm;
+  const ti = S.tracks.findIndex((t) => t.name === 'bass'), bt = S.tracks[ti];
+  const r = place(segs, { bpm: S.bpm, origin: tempo.phase, grid: S.grid, loopBeats: L(), scale: S.scale, root: S.key === 'auto' ? 'auto' : NOTE.indexOf(S.key), tune: false });
+  const best = segs.reduce((a, b) => (b.te - b.ts > a.te - a.ts ? b : a)), id = `${loaded.name.slice(0, 24)} bass #${samples.length + 1}`;
+  addSample(id, cut(lp, sr, best.ts, best.te), best.pf, true);
+  bt.notes = r.notes; bt.inst = id; S.sel = ti; S.rootUsed = r.root;
+  changed();
+  log(`bass track: ${r.notes.length} notes @ ${S.bpm} bpm (the clip's tempo; wrong? say “bpm 120”), key ${NOTE[r.root]} ${S.scale}. Its bass sound is now the bass instrument.`);
+  await ensure(); if (!playing) start();
+}
+
+// ---------- assistant: song search ----------
+const esc = (t) => t.replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+let songs = [], audio = null;
+async function songSearch(q) {
+  const ws = q.split(/\s+/).filter(Boolean), tries = [ws.join(' ')];
+  for (const n of [4, 3, 2]) for (let i = 0; ws.length > n && i + n <= ws.length; i++) tries.push(ws.slice(i, i + n).join(' '));   // lyric-ish text: try shorter phrases
+  log(`searching songs for “${q}”…`);
+  for (const term of [...new Set(tries)].slice(0, 8)) {
+    let r; try { r = await (await fetch(`https://itunes.apple.com/search?media=music&entity=song&limit=6&term=${encodeURIComponent(term)}`)).json(); } catch { return log('song search unreachable (offline?)'); }
+    if (!r.results?.length) continue;
+    songs = r.results;
+    $('#songs').innerHTML = songs.map((x, i) => `<div class="song"><img src="${esc(x.artworkUrl60)}" alt=""><span><b>${esc(x.trackName)}</b><br>${esc(x.artistName)}</span><button data-p="${i}" title="hear the 30s preview">▶</button><button data-u="${i}" title="load the 30s preview into the lab">use</button></div>`).join('');
+    return log(`${songs.length} matches${term === q ? '' : ` for “${term}”`}. ▶ to hear it, “use” to load the 30s preview as a source (then say “bass of this track”).`);
+  }
+  log('no matches. Title/artist search only for now; lyric and hum search need a backend (see GitHub issues).');
+}
+$('#songs').onclick = async (e) => {
+  const p = e.target.dataset.p, u = e.target.dataset.u;
+  if (p != null) { const url = songs[p].previewUrl; if (audio && !audio.paused && audio.src === url) return audio.pause(); audio?.pause(); audio = new Audio(url); audio.play(); }
+  if (u != null) {
+    const x = songs[u]; await ensure(); log(`fetching the 30s preview of “${x.trackName}”…`);
+    try { setLoaded(await ctx.decodeAudioData(await (await fetch(x.previewUrl)).arrayBuffer()), `${x.trackName} - ${x.artistName}`, true); log('loaded. Say or type “bass of this track”, or drag a region on the waveform first.'); }
+    catch (err) { log(`couldn't fetch/decode that preview: ${err.message}`); }
+  }
+};
+$('#find').onclick = () => songSearch($('#q').value.trim());
+$('#q').onkeydown = (e) => { if (e.key === 'Enter') $('#find').click(); };
 
 // ---------- ui: tracks / lab ----------
 function renderTracks() {
@@ -285,11 +339,12 @@ $('#bpm').value = S.bpm; $('#lat').value = S.lat; $('#bars').value = S.bars; $('
 $('#key').innerHTML = ['auto', ...NOTE].map((k) => `<option>${k}</option>`).join(''); $('#key').value = S.key;
 $('#scale').innerHTML = Object.keys(SCALES).map((k) => `<option>${k}</option>`).join(''); $('#scale').value = S.scale;
 
-$('#bpm').onchange = (e) => {
-  const v = Math.max(50, Math.min(200, +e.target.value || 90));
+function setBpm(raw) {
+  const v = Math.max(50, Math.min(200, +raw || 90));
   if (playing) { const cur = (ctx.currentTime - T0) * bps(); S.bpm = v; T0 = ctx.currentTime - cur / bps(); } else S.bpm = v;
-  e.target.value = v; changed();
-};
+  $('#bpm').value = v; changed();
+}
+$('#bpm').onchange = (e) => setBpm(e.target.value);
 $('#bars').onchange = (e) => { S.bars = +e.target.value; changed(); };
 $('#key').onchange = (e) => { S.key = e.target.value; changed(); };
 $('#scale').onchange = (e) => { S.scale = e.target.value; changed(); };
@@ -315,6 +370,63 @@ $('#wav').onclick = async () => {
   const b = await oc.startRendering();
   dl(toWav([b.getChannelData(0), b.getChannelData(1)], sr), 'humfm.wav', 'audio/wav'); log('rendered humfm.wav (one loop + tail)');
 };
+// ---------- assistant: command bar (typed or spoken) ----------
+const soundNames = () => [...Object.keys(PRESETS), ...samples.map((x) => x.id)];
+const trackIdx = (n) => S.tracks.findIndex((t) => t.name === n);
+async function runCmd(a) {
+  switch (a.a) {
+    case 'play': await ensure(); if (!playing) start(); break;
+    case 'stop': if (ctx && playing) stop(); break;
+    case 'hum': return startRec();
+    case 'undo': case 'clear': case 'snap': $({ undo: '#undo', clear: '#clr', snap: '#snapk' }[a.a]).click(); break;
+    case 'help': log(HELP); break;
+    case 'bpm': setBpm(a.v); log(`bpm ${S.bpm}`); break;
+    case 'key':
+      if (!NOTE.includes(a.key)) return log(`unknown key “${a.key}”`);
+      S.key = a.key; if (a.scale) S.scale = a.scale; else if (S.scale === 'off') S.scale = 'major';
+      $('#key').value = S.key; $('#scale').value = S.scale; changed(); log(`key ${S.key} ${S.scale}`); break;
+    case 'scale': S.scale = a.v; $('#scale').value = a.v; changed(); break;
+    case 'bars': if (![1, 2, 4, 8].includes(a.v)) return log('bars: 1, 2, 4 or 8'); S.bars = a.v; $('#bars').value = a.v; changed(); break;
+    case 'select': S.sel = trackIdx(a.track); changed(); break;
+    case 'mute': case 'unmute': case 'solo': { const t = S.tracks[trackIdx(a.track)]; if (a.a === 'solo') t.solo ^= 1; else t.mute = +(a.a === 'mute'); syncMix(); changed(); break; }
+    case 'octave': shift(a.v); break;
+    case 'inst': {
+      const i = trackIdx(a.track), t = S.tracks[i];
+      if (t.drum) return log('drums: swap individual hits in the lab');
+      if (!a.inst) return log(`no sound like “${a.asked}”. have: ${soundNames().join(', ')}`);
+      t.inst = a.inst; S.sel = i; changed(); preview(t, t.c); break;
+    }
+    case 'notes': {
+      const t = sel(); if (t.drum) return log('select a melodic track first (lead / bass / keys)');
+      const r = parseNotes(a.text, { center: t.c });
+      if (!r.notes.length) return log(`no notes in “${a.text}”. e.g. notes e e g e d c b  (e:1.5 longer · - hold · . rest)`);
+      snapshot();
+      const need = [1, 2, 4, 8].find((b) => b * 4 >= r.end) ?? 8;
+      if (need > S.bars) { S.bars = need; $('#bars').value = need; }
+      t.notes = r.notes.filter((n) => n.b < L()).map((n) => ({ ...n, d: Math.min(n.d, L() - n.b) }));
+      changed(); log(`${t.name}: ${t.notes.map((n) => name(n.p)).join(' ')}${r.bad.length ? `  (skipped: ${r.bad.join(' ')})` : ''}`); break;
+    }
+    case 'search': return songSearch(a.q);
+    case 'extract':
+      return a.what === 'bass' ? extractBass() : log(`only the bass can be pulled out for now (splitting other parts needs real stem separation, see GitHub issues). Try “bass of this track”.`);
+    default: log(`didn't get that. ${HELP}`);
+  }
+}
+$('#cmdbar').onsubmit = (e) => {
+  e.preventDefault();
+  const text = $('#cmd').value.trim(); if (!text) return;
+  $('#cmd').value = ''; log(`$ ${text}`);
+  runCmd(parseCommand(text, { sounds: soundNames() }));
+};
+const Speech = window.SpeechRecognition || window.webkitSpeechRecognition;
+$('#say').hidden = !Speech;
+$('#say').onclick = () => {
+  const r = new Speech(); r.lang = 'en-US'; r.interimResults = false;
+  r.onstart = () => log('listening… say a command (Chrome sends this audio to its speech service)');
+  r.onresult = (e) => { $('#cmd').value = e.results[0][0].transcript; $('#cmdbar').requestSubmit(); };
+  r.onerror = (e) => log(`speech: ${e.error}`);
+  r.start();
+};
 addEventListener('keydown', (e) => {
   if (e.target.matches('input,select')) return;
   if (e.code === 'Space') { e.preventDefault(); $('#play').click(); }
@@ -338,3 +450,4 @@ let fr = 0;
 renderTracks(); renderLab(); huntLinks(); ui();
 log('hi. pick a track, hit ● hum, wait out the count-in, hum a tune. headphones help.');
 log('then try timbres in the lab, or drop an audio clip to steal its sound.');
+log(`or just type to the assistant. ${HELP}`);

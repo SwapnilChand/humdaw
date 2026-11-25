@@ -1,0 +1,31 @@
+// node test-cmd.mjs — the command-bar grammar
+import assert from 'node:assert/strict';
+import { parseCommand as p } from './cmd.js';
+const sounds = ['candy lead', 'acid bass', 'sub bass', 'pluck', 'fm bell', 'my hum #1', 'seven nation army - the white stripes bass #2'];
+const eq = (txt, want) => assert.deepEqual(p(txt, { sounds }), want, txt);
+
+eq('notes e e g e d c b', { a: 'notes', text: 'e e g e d c b' });
+eq('e e g e d c b', { a: 'notes', text: 'e e g e d c b' });
+eq('e:1.5 e:.5 g - .', { a: 'notes', text: 'e:1.5 e:.5 g - .' });
+eq('bpm 124', { a: 'bpm', v: 124 });
+eq('set the tempo to 96', { a: 'bpm', v: 96 });
+eq('key e minor', { a: 'key', key: 'E', scale: 'minor' });
+eq('Key of B flat major', { a: 'key', key: 'A#', scale: 'major' });
+eq('scale pentatonic minor', { a: 'scale', v: 'pent min' });
+eq('4 bars', { a: 'bars', v: 4 });
+eq('bass acid', { a: 'inst', track: 'bass', inst: 'acid bass', asked: 'acid' });
+eq('make the lead candy', { a: 'inst', track: 'lead', inst: 'candy lead', asked: 'candy' });
+eq('use pluck on keys', { a: 'inst', track: 'keys', inst: 'pluck', asked: 'pluck' });
+eq('use my hum on the lead', { a: 'inst', track: 'lead', inst: 'my hum #1', asked: 'my hum' });
+eq('mute drums', { a: 'mute', track: 'drums' });
+eq('select bass', { a: 'select', track: 'bass' });
+eq('octave down', { a: 'octave', v: -12 });
+eq('search seven nation army', { a: 'search', q: 'seven nation army' });
+eq("hey search what this song was i'm gonna hm hm hm seven nation army", { a: 'search', q: "i'm gonna seven nation army" });
+eq('use the bass of this track as the source of my bass', { a: 'extract', what: 'bass' });
+eq('give me the melody of this song', { a: 'extract', what: 'melody' });
+eq('record', { a: 'hum' });
+eq('undo', { a: 'undo' });
+eq('make me a sandwich', { a: '?' });
+eq('', { a: '?' });
+console.log('ok — command grammar');
